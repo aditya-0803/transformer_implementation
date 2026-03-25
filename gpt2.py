@@ -224,95 +224,107 @@ class DataLoaderLite:
         return x, y
 
 
-model = GPT(GPTConfig())
-model = model.to(device)
-model = torch.compile(model)
+if __name__ == "__main__":
 
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 200
-max_steps = 5000
+    model = GPT(GPTConfig())
+    model = model.to(device)
+    model = torch.compile(model)
+
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 200
+    max_steps = 19073
+    checkpoint_steps = {4768: "25pct", 9536: "50pct", 14304: "75pct", 19072: "100pct"}
+
+    def get_lr(step):
+        if step < warmup_steps:
+            return max_lr * (step + 1) / warmup_steps
+        if step > max_steps:
+            return min_lr
+        decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (max_lr - min_lr)
+
+    total_batch_size = 524288
+    B = 16
+    T = 1024
+    assert total_batch_size % (B * T) == 0
+    grad_accum_steps = total_batch_size // (B * T)
+    print(f"grad_accum_steps: {grad_accum_steps}")
+
+    train_loader = DataLoaderLite(B=B, T=T, split="train")
+    val_loader = DataLoaderLite(B=B, T=T, split="val")
+    optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=max_lr, device=device)
+
+    def save_checkpoint(step, label):
+        model.eval()
+        with torch.no_grad():
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                val_loss_accum = 0.0
+                val_steps = 20
+                for _ in range(val_steps):
+                    xb, yb = val_loader.next_batch()
+                    logits, loss = model(xb, yb)
+                    val_loss_accum += loss.detach()
+                val_loss_accum /= val_steps
+        fname = f"checkpoint_{label}.pt"
+        torch.save({
+            'model': model.state_dict(),
+            'config': model.config,
+            'step': step,
+            'val_loss': val_loss_accum.item(),
+        }, fname)
+        print(f"checkpoint saved: {fname} | val_loss: {val_loss_accum.item():.6f}")
+        model.train()
+
+    for step in range(max_steps):
+        t0 = time.time()
+        optimizer.zero_grad(set_to_none=True)
+        loss_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+            xb, yb = train_loader.next_batch()
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                logits, loss = model(xb, yb)
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
+            loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        optimizer.step()
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        tokens_per_sec = (B * T * grad_accum_steps) / (t1 - t0)
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+
+        if step in checkpoint_steps:
+            save_checkpoint(step, checkpoint_steps[step])
 
 
-def get_lr(step):
-    if step < warmup_steps:
-        return max_lr * (step + 1) / warmup_steps
-    if step > max_steps:
-        return min_lr
-    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
+    enc = tiktoken.get_encoding('gpt2')
+    num_return_sequences = 4
+    max_length = 50
 
-total_batch_size = 524288
-B = 16
-T = 1024
-assert total_batch_size % (B * T) == 0
-grad_accum_steps = total_batch_size // (B * T)
-print(f"grad_accum_steps: {grad_accum_steps}")
+    tokens = enc.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    tokens = tokens.to(device)
 
-train_loader = DataLoaderLite(B=B, T=T, split="train")
-optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=max_lr, device=device)
-
-
-for step in range(max_steps):
-    t0 = time.time()
-    optimizer.zero_grad(set_to_none=True)
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        xb, yb = train_loader.next_batch()
+    torch.manual_seed(42)
+    with torch.no_grad():
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            logits, loss = model(xb, yb)
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-        loss.backward()
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = (t1 - t0) * 1000
-    tokens_per_sec = (B * T * grad_accum_steps) / (t1 - t0)
-    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            while tokens.size(1) < max_length:
+                logits, _ = model(tokens)
+                logits = logits[:, -1, :]
+                probs = F.softmax(logits, dim=-1)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                ix = torch.multinomial(topk_probs, 1)
+                next_token = torch.gather(topk_indices, -1, ix)
+                tokens = torch.cat((tokens, next_token), dim=1)
 
-
-model.eval()
-val_loader = DataLoaderLite(B=B, T=T, split="val")
-with torch.no_grad():
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        val_loss_accum = 0.0
-        val_steps = 20
-        for _ in range(val_steps):
-            xb, yb = val_loader.next_batch()
-            logits, loss = model(xb, yb)
-            val_loss_accum += loss.detach()
-        val_loss_accum /= val_steps
-print(f"validation loss: {val_loss_accum.item():.6f}")
-
-
-enc = tiktoken.get_encoding('gpt2')
-num_return_sequences = 4
-max_length = 50
-
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-tokens = tokens.to(device)
-
-torch.manual_seed(42)
-with torch.no_grad():
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        while tokens.size(1) < max_length:
-            logits, _ = model(tokens)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-            ix = torch.multinomial(topk_probs, 1)
-            next_token = torch.gather(topk_indices, -1, ix)
-            tokens = torch.cat((tokens, next_token), dim=1)
-
-for i in range(num_return_sequences):
-    decoded = enc.decode(tokens[i].tolist())
-    print(f">> sample {i}: {decoded}")
+    for i in range(num_return_sequences):
+        decoded = enc.decode(tokens[i].tolist())
+        print(f">> sample {i}: {decoded}")
